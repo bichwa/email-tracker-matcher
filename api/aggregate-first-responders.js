@@ -20,9 +20,9 @@ module.exports = async (req, res) => {
 
   try {
     // Default: aggregate yesterday (safe for cron)
-    const date =
-      req.query.date ||
-      new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const targetDate =
+  req.query.date ||
+  new Date().toISOString().slice(0, 10);
 
     // 1️⃣ Pull first-responder emails for the day
     const { data: rows, error } = await supabase

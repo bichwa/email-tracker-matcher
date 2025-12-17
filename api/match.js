@@ -1,5 +1,6 @@
 // api/match.js
 // Email Tracker — Matcher + First Responder Metrics
+console.log('MATCHER VERSION 4B-B — METRICS ENABLED');
 
 const { createClient } = require('@supabase/supabase-js');
 
@@ -164,12 +165,14 @@ module.exports = async (req, res) => {
 
     res.json({
       success: true,
-      matched: matchedCount,
-      duration_seconds: (
-        (Date.now() - start) /
-        1000
-      ).toFixed(2)
+  matched: matchedCount,
+  metrics_written: true,
+  version: '4B-B',
+  duration_seconds: ((Date.now() - start) / 1000).toFixed(2)
+      
     });
+
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });

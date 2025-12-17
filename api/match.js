@@ -1,180 +1,145 @@
-// api/match.js
-// Email Tracker — Matcher + First Responder Metrics
-console.log('MATCHER VERSION 4B-B — METRICS ENABLED');
+// email-tracker-matcher/api/match.js
+// Matches incoming emails to first responses
+// Supports TEAM mailbox attribution (Step 4F)
 
-const { createClient } = require('@supabase/supabase-js');
+const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
-const SLA_MINUTES = Number(process.env.SLA_TARGET_MINUTES || 15);
+const SLA_TARGET_MINUTES = parseInt(
+  process.env.SLA_TARGET_MINUTES || "15",
+  10
+);
 
 module.exports = async (req, res) => {
   try {
-    // 🔐 Auth
+    /* ------------------ AUTH ------------------ */
     if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
-      return res.status(401).json({ error: 'Unauthorized' });
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
     const start = Date.now();
 
-    /* -------------------------------------------------------
-       STEP 1 — Fetch unmatched incoming emails
-    -------------------------------------------------------- */
+    /* ------------------ FETCH UNRESPONDED INCOMING ------------------ */
+    const { data: incomingEmails, error } = await supabase
+      .from("tracked_emails")
+      .select("*")
+      .eq("is_incoming", true)
+      .eq("has_response", false)
+      .order("received_at", { ascending: true });
 
-    const { data: pending, error: pendingError } = await supabase
-      .from('tracked_emails')
-      .select('*')
-      .eq('is_incoming', true)
-      .eq('has_response', false)
-      .order('received_at', { ascending: true });
+    if (error) throw error;
 
-    if (pendingError) throw pendingError;
+    let matched = 0;
 
-    let matchedCount = 0;
-
-    /* -------------------------------------------------------
-       STEP 2 — Match first response
-    -------------------------------------------------------- */
-
-    for (const incoming of pending) {
+    /* ------------------ MATCH LOOP ------------------ */
+    for (const incoming of incomingEmails) {
       let response = null;
 
-      // Strategy A — Conversation ID
+      const isTeamMailbox =
+        incoming.employee_email &&
+        incoming.employee_email.toLowerCase().startsWith("team@");
+
+      /* ---------- STRATEGY 1: CONVERSATION ID ---------- */
       if (incoming.conversation_id) {
-        const { data } = await supabase
-          .from('tracked_emails')
-          .select('*')
-          .eq('conversation_id', incoming.conversation_id)
-          .eq('is_incoming', false)
-          .gte('received_at', incoming.received_at)
-          .order('received_at', { ascending: true })
+        let query = supabase
+          .from("tracked_emails")
+          .select("*")
+          .eq("conversation_id", incoming.conversation_id)
+          .eq("is_incoming", false)
+          .gte("received_at", incoming.received_at)
+          .order("received_at", { ascending: true })
           .limit(1);
 
+        // 🔑 Team mailbox logic:
+        // Do NOT restrict responder mailbox for team@
+        if (!isTeamMailbox) {
+          query = query.eq(
+            "employee_email",
+            incoming.employee_email
+          );
+        }
+
+        const { data } = await query;
         if (data?.length) response = data[0];
       }
 
-      // Strategy B — Same client within 24h
+      /* ---------- STRATEGY 2: SAME CLIENT (24h) ---------- */
       if (!response) {
-        const end = new Date(
-          new Date(incoming.received_at).getTime() + 24 * 60 * 60 * 1000
+        const endWindow = new Date(
+          new Date(incoming.received_at).getTime() +
+            24 * 60 * 60 * 1000
         ).toISOString();
 
-        const { data } = await supabase
-          .from('tracked_emails')
-          .select('*')
-          .eq('client_email', incoming.client_email)
-          .eq('is_incoming', false)
-          .gte('received_at', incoming.received_at)
-          .lte('received_at', end)
-          .order('received_at', { ascending: true })
+        let query = supabase
+          .from("tracked_emails")
+          .select("*")
+          .eq("client_email", incoming.client_email)
+          .eq("is_incoming", false)
+          .gte("received_at", incoming.received_at)
+          .lte("received_at", endWindow)
+          .order("received_at", { ascending: true })
           .limit(1);
 
+        if (!isTeamMailbox) {
+          query = query.eq(
+            "employee_email",
+            incoming.employee_email
+          );
+        }
+
+        const { data } = await query;
         if (data?.length) response = data[0];
       }
 
       if (!response) continue;
 
+      /* ------------------ RESPONSE METRICS ------------------ */
       const responseMinutes = Math.round(
         (new Date(response.received_at) -
           new Date(incoming.received_at)) /
           60000
       );
 
+      const slaBreached = responseMinutes > SLA_TARGET_MINUTES;
+
+      /* ------------------ UPDATE INCOMING EMAIL ------------------ */
       await supabase
-        .from('tracked_emails')
+        .from("tracked_emails")
         .update({
           has_response: true,
           responded_at: response.received_at,
           responded_by: response.responded_by,
           response_time_minutes: responseMinutes,
 
-          // 🔒 First responder lock
-          first_response_at: response.received_at,
-          first_responder_email: response.responded_by
+          // 🔒 FIRST RESPONDER (LOCK ONCE)
+          first_response_at:
+            incoming.first_response_at ?? response.received_at,
+          first_responder_email:
+            incoming.first_responder_email ??
+            response.responded_by,
+
+          sla_breached: slaBreached
         })
-        .eq('id', incoming.id);
+        .eq("id", incoming.id);
 
-      matchedCount++;
+      matched++;
     }
 
-    /* -------------------------------------------------------
-       STEP 3 — DAILY FIRST RESPONDER METRICS (FIX)
-    -------------------------------------------------------- */
-
-    const today = new Date().toISOString().split('T')[0];
-
-    const { data: firstResponses } = await supabase
-      .from('tracked_emails')
-      .select(
-        'first_responder_email, response_time_minutes, received_at'
-      )
-      .eq('is_incoming', true)
-      .not('first_responder_email', 'is', null)
-      .gte('received_at', `${today}T00:00:00`)
-      .lte('received_at', `${today}T23:59:59`);
-
-    const byResponder = {};
-
-    for (const r of firstResponses || []) {
-      const email = r.first_responder_email;
-
-      if (!byResponder[email]) {
-        byResponder[email] = {
-          count: 0,
-          totalMinutes: 0,
-          breaches: 0
-        };
-      }
-
-      byResponder[email].count++;
-      byResponder[email].totalMinutes += r.response_time_minutes || 0;
-
-      if ((r.response_time_minutes || 0) > SLA_MINUTES) {
-        byResponder[email].breaches++;
-      }
-    }
-
-    for (const email of Object.keys(byResponder)) {
-      const row = byResponder[email];
-
-      await supabase
-        .from('daily_first_responder_metrics')
-        .upsert(
-          {
-            date: today,
-            first_responder_email: email,
-            total_first_responses: row.count,
-            avg_first_response_minutes:
-              row.count > 0
-                ? Number(
-                    (row.totalMinutes / row.count).toFixed(2)
-                  )
-                : null,
-            sla_breaches: row.breaches
-          },
-          { onConflict: 'date,first_responder_email' }
-        );
-    }
-
-    /* -------------------------------------------------------
-       DONE
-    -------------------------------------------------------- */
-
+    /* ------------------ DONE ------------------ */
     res.json({
       success: true,
-  matched: matchedCount,
-  metrics_written: true,
-  version: '4B-B',
-  duration_seconds: ((Date.now() - start) / 1000).toFixed(2)
-      
+      matched,
+      duration_seconds: (
+        (Date.now() - start) /
+        1000
+      ).toFixed(2)
     });
-
-
   } catch (err) {
-    console.error(err);
+    console.error("Matcher error:", err);
     res.status(500).json({ error: err.message });
   }
 };

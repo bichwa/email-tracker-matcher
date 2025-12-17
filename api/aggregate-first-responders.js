@@ -11,7 +11,6 @@ const supabase = createClient(
 );
 
 module.exports = async (req, res) => {
-  // 🔐 Protect endpoint
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -19,12 +18,10 @@ module.exports = async (req, res) => {
   const start = Date.now();
 
   try {
-    // Default: aggregate yesterday (safe for cron)
     const targetDate =
-  req.query.date ||
-  new Date().toISOString().slice(0, 10);
+      req.query.date ||
+      new Date().toISOString().slice(0, 10);
 
-    // 1️⃣ Pull first-responder emails for the day
     const { data: rows, error } = await supabase
       .from('tracked_emails')
       .select(`
@@ -33,25 +30,25 @@ module.exports = async (req, res) => {
         received_at
       `)
       .not('first_responder_email', 'is', null)
-      .gte('received_at', `${date}T00:00:00`)
-      .lte('received_at', `${date}T23:59:59`);
+      .gte('received_at', `${targetDate}T00:00:00`)
+      .lte('received_at', `${targetDate}T23:59:59`);
 
     if (error) throw error;
 
     if (!rows || rows.length === 0) {
       return res.json({
         success: true,
-        date,
+        date: targetDate,
         inserted: 0,
         note: 'No first-responder emails for this date'
       });
     }
 
-    // 2️⃣ Group by responder
     const buckets = {};
 
     for (const r of rows) {
       const email = r.first_responder_email;
+
       if (!buckets[email]) {
         buckets[email] = {
           total: 0,
@@ -70,7 +67,6 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 3️⃣ Build upsert payload
     const payload = Object.entries(buckets).map(
       ([employee_email, stats]) => {
         const avg =
@@ -80,10 +76,10 @@ module.exports = async (req, res) => {
             : null;
 
         return {
-          date,
+          date: targetDate,
           employee_email,
           total_first_responses: stats.total,
-          avg_response_time_minutes: avg
+          avg_first_response_minutes: avg
             ? Number(avg.toFixed(2))
             : null,
           sla_breaches: stats.breaches,
@@ -92,7 +88,6 @@ module.exports = async (req, res) => {
       }
     );
 
-    // 4️⃣ Upsert metrics
     const { error: upsertError } = await supabase
       .from('daily_first_responder_metrics')
       .upsert(payload, {
@@ -103,7 +98,7 @@ module.exports = async (req, res) => {
 
     res.json({
       success: true,
-      date,
+      date: targetDate,
       responders: payload.length,
       duration_seconds: Number(((Date.now() - start) / 1000).toFixed(2))
     });

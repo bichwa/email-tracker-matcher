@@ -1,7 +1,3 @@
-// email-tracker-matcher/api/match.js
-// Matches incoming emails to first responses
-// Runs asynchronously to avoid cron timeouts
-
 const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(
@@ -14,21 +10,31 @@ const SLA_TARGET_MINUTES = parseInt(
   10
 );
 
+const BATCH_SIZE = 25;
+const MAX_RUNTIME_MS = 50000;
+
 async function runMatcher() {
   const start = Date.now();
+  let matched = 0;
 
   const { data: incomingEmails, error } = await supabase
     .from("tracked_emails")
     .select("*")
     .eq("is_incoming", true)
     .eq("has_response", false)
-    .order("received_at", { ascending: true });
+    .order("received_at", { ascending: true })
+    .limit(BATCH_SIZE);
 
-  if (error) throw error;
-
-  let matched = 0;
+  if (error) {
+    throw error;
+  }
 
   for (const incoming of incomingEmails) {
+    if (Date.now() - start > MAX_RUNTIME_MS) {
+      console.log("Stopping early to avoid timeout");
+      break;
+    }
+
     let response = null;
 
     const isTeamMailbox =
@@ -53,7 +59,9 @@ async function runMatcher() {
       }
 
       const { data } = await query;
-      if (data && data.length) response = data[0];
+      if (data && data.length) {
+        response = data[0];
+      }
     }
 
     if (!response) {
@@ -80,15 +88,18 @@ async function runMatcher() {
       }
 
       const { data } = await query;
-      if (data && data.length) response = data[0];
+      if (data && data.length) {
+        response = data[0];
+      }
     }
 
-    if (!response) continue;
+    if (!response) {
+      continue;
+    }
 
     const responseMinutes = Math.round(
       (new Date(response.received_at) -
-        new Date(incoming.received_at)) /
-        60000
+        new Date(incoming.received_at)) / 60000
     );
 
     const slaBreached =
@@ -114,12 +125,9 @@ async function runMatcher() {
     matched++;
   }
 
-  console.log("Matcher completed", {
+  console.log("Matcher batch complete", {
     matched,
-    duration_seconds: (
-      (Date.now() - start) /
-      1000
-    ).toFixed(2)
+    processed: incomingEmails.length
   });
 }
 
@@ -131,24 +139,21 @@ module.exports = async (req, res) => {
       authHeader !==
       `Bearer ${process.env.CRON_SECRET}`
     ) {
-      return res
-        .status(401)
-        .json({ error: "Unauthorized" });
+      return res.status(401).json({
+        error: "Unauthorized"
+      });
     }
 
     res.status(200).json({
       ok: true,
-      started: true
+      batch: true
     });
 
     runMatcher().catch(err => {
-      console.error(
-        "Matcher background error:",
-        err
-      );
+      console.error("Matcher error", err);
     });
   } catch (err) {
-    console.error("Matcher handler error:", err);
+    console.error("Handler error", err);
     res.status(500).json({
       error: "Internal error"
     });

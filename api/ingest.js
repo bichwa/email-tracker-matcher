@@ -1,94 +1,119 @@
-const axios = require("axios");
-const { createClient } = require("@supabase/supabase-js");
+import axios from "axios";
+import { createClient } from "@supabase/supabase-js";
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
-const TENANT_ID = process.env.AZURE_TENANT_ID;
-const CLIENT_ID = process.env.AZURE_CLIENT_ID;
-const CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET;
+const SLA_MINUTES = 15;
+const MAX_MESSAGES = 50;
 
-const GRAPH_SCOPE = "https://graph.microsoft.com/.default";
-const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
+const SYSTEM_SENDERS = [
+  "solvit@solvit.com"
+];
+
+const SYSTEM_SUBJECT_PATTERNS = [
+  "valuation status update",
+  "valuation request",
+  "pending"
+];
+
+function isSystemEmail(email) {
+  if (!email) return false;
+  return SYSTEM_SENDERS.some(s => email.toLowerCase().includes(s));
+}
+
+function isSystemSubject(subject) {
+  if (!subject) return false;
+  const s = subject.toLowerCase();
+  return SYSTEM_SUBJECT_PATTERNS.some(p => s.includes(p));
+}
+
+function detectNamedEmployee(subject, body, employees) {
+  const text = `${subject || ""} ${body || ""}`.toLowerCase();
+  return employees.find(e =>
+    text.includes(e.name.toLowerCase())
+  );
+}
 
 async function getGraphToken() {
-  const params = new URLSearchParams();
-  params.append("client_id", CLIENT_ID);
-  params.append("client_secret", CLIENT_SECRET);
-  params.append("grant_type", "client_credentials");
-  params.append("scope", GRAPH_SCOPE);
-
   const res = await axios.post(
-    `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
-    params.toString(),
+    `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}/oauth2/v2.0/token`,
+    new URLSearchParams({
+      client_id: process.env.AZURE_CLIENT_ID,
+      client_secret: process.env.AZURE_CLIENT_SECRET,
+      grant_type: "client_credentials",
+      scope: "https://graph.microsoft.com/.default"
+    }),
     { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
   );
-
   return res.data.access_token;
 }
 
-async function ingestEmails() {
-  console.log("Ingest started");
-
-  const token = await getGraphToken();
-
-  const headers = {
-    Authorization: `Bearer ${token}`
-  };
-
-  const res = await axios.get(
-    `${GRAPH_BASE}/users`,
-    { headers }
-  );
-
-  const users = res.data.value || [];
-
-  for (const user of users) {
-    if (!user.mail) continue;
-
-    const mailRes = await axios.get(
-      `${GRAPH_BASE}/users/${user.id}/mailFolders/inbox/messages?$top=25`,
-      { headers }
-    );
-
-    const messages = mailRes.data.value || [];
-
-    for (const msg of messages) {
-      await supabase
-        .from("tracked_emails")
-        .upsert(
-          {
-            graph_message_id: msg.id,
-            conversation_id: msg.conversationId,
-            subject: msg.subject,
-            from_email: msg.from?.emailAddress?.address,
-            to_email: user.mail,
-            received_at: msg.receivedDateTime,
-            is_incoming: true,
-            employee_email: user.mail,
-            client_email: msg.from?.emailAddress?.address
-          },
-          { onConflict: "graph_message_id" }
-        );
-    }
-  }
-
-  console.log("Ingest finished");
-}
-
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  res.status(200).json({
-    ok: true,
-    ingesting: true
-  });
+  try {
+    const token = await getGraphToken();
 
-  ingestEmails().catch(err => {
-    console.error("Ingest error:", err.message);
-  });
-};
+    const employeesRes = await supabase
+      .from("employees")
+      .select("email, name");
+
+    const employees = employeesRes.data || [];
+
+    const inboxRes = await axios.get(
+      "https://graph.microsoft.com/v1.0/users/team@solvit.com/mailFolders/inbox/messages?$top=50&$orderby=receivedDateTime desc",
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    const messages = inboxRes.data.value || [];
+
+    let inserted = 0;
+
+    for (const msg of messages.slice(0, MAX_MESSAGES)) {
+      if (isSystemEmail(msg.from?.emailAddress?.address)) continue;
+      if (isSystemSubject(msg.subject)) continue;
+
+      const receivedAt = new Date(msg.receivedDateTime).toISOString();
+
+      const named = detectNamedEmployee(
+        msg.subject,
+        msg.body?.content,
+        employees
+      );
+
+      const employeeEmail = named
+        ? named.email
+        : "team@solvit.com";
+
+      const { error } = await supabase
+        .from("tracked_emails")
+        .upsert({
+          graph_message_id: msg.id,
+          conversation_id: msg.conversationId,
+          subject: msg.subject,
+          from_email: msg.from.emailAddress.address,
+          to_email: "team@solvit.com",
+          received_at: receivedAt,
+          is_incoming: true,
+          has_response: false,
+          client_email: msg.from.emailAddress.address,
+          employee_email: employeeEmail
+        }, { onConflict: "graph_message_id" });
+
+      if (!error) inserted++;
+    }
+
+    res.json({
+      ok: true,
+      inserted
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+}

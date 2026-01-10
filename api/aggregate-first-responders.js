@@ -16,24 +16,26 @@ export default async function handler(req, res) {
 
     const date =
       req.query.date ||
-      new Date().toISOString().slice(0, 10);
+      new Date(Date.now() - 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+
+    const start = `${date}T00:00:00`;
+    const end = `${date}T23:59:59`;
 
     const { data: emails, error } = await supabase
       .from("tracked_emails")
       .select(
         `
         employee_email,
-        received_at,
-        first_response_at
-        `
+        first_response_minutes
+      `
       )
-      .gte("received_at", `${date}T00:00:00Z`)
-      .lte("received_at", `${date}T23:59:59Z`)
-      .not("first_response_at", "is", null);
+      .gte("received_at", start)
+      .lte("received_at", end)
+      .not("first_response_minutes", "is", null);
 
-    if (error) {
-      throw error;
-    }
+    if (error) throw error;
 
     if (!emails || emails.length === 0) {
       return res.json({
@@ -44,51 +46,45 @@ export default async function handler(req, res) {
       });
     }
 
-    const grouped = {};
+    const byEmployee = {};
 
     for (const e of emails) {
-      const mins =
-        (new Date(e.first_response_at) -
-          new Date(e.received_at)) /
-        60000;
-
-      if (!grouped[e.employee_email]) {
-        grouped[e.employee_email] = {
-          employee_email: e.employee_email,
-          total_first_responses: 0,
-          total_minutes: 0,
-          sla_breaches: 0
+      if (!byEmployee[e.employee_email]) {
+        byEmployee[e.employee_email] = {
+          total: 0,
+          breaches: 0,
+          sumMinutes: 0
         };
       }
 
-      grouped[e.employee_email].total_first_responses += 1;
-      grouped[e.employee_email].total_minutes += mins;
+      byEmployee[e.employee_email].total += 1;
+      byEmployee[e.employee_email].sumMinutes += e.first_response_minutes;
 
-      if (mins > SLA_MINUTES) {
-        grouped[e.employee_email].sla_breaches += 1;
+      if (e.first_response_minutes > SLA_MINUTES) {
+        byEmployee[e.employee_email].breaches += 1;
       }
     }
 
-    const rows = Object.values(grouped).map(r => ({
-      date,
-      employee_email: r.employee_email,
-      total_first_responses: r.total_first_responses,
-      avg_first_response_minutes: Math.round(
-        r.total_minutes / r.total_first_responses
-      ),
-      sla_breaches: r.sla_breaches,
-      sla_target_minutes: SLA_MINUTES
-    }));
+    const rows = Object.entries(byEmployee).map(
+      ([employee_email, v]) => ({
+        date,
+        employee_email,
+        total_first_responses: v.total,
+        avg_first_response_minutes: Math.round(
+          v.sumMinutes / v.total
+        ),
+        sla_breaches: v.breaches,
+        sla_target_minutes: SLA_MINUTES
+      })
+    );
 
-    const { error: upsertError } = await supabase
+    const { error: insertError } = await supabase
       .from("daily_first_responder_metrics")
       .upsert(rows, {
         onConflict: "date,employee_email"
       });
 
-    if (upsertError) {
-      throw upsertError;
-    }
+    if (insertError) throw insertError;
 
     return res.json({
       success: true,
@@ -98,7 +94,7 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error(err);
     return res.status(500).json({
-      error: "FUNCTION_INVOCATION_FAILED",
+      error: "Aggregation failed",
       message: err.message
     });
   }

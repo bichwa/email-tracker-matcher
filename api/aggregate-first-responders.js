@@ -9,34 +9,33 @@ const SLA_MINUTES = 15;
 
 export default async function handler(req, res) {
   try {
-    // Auth
     const auth = req.headers.authorization || "";
     if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // Date handling
     const date =
       req.query.date ||
       new Date().toISOString().slice(0, 10);
 
-    // Pull first responses for the day
-    const { data: responses, error } = await supabase
+    const { data: emails, error } = await supabase
       .from("tracked_emails")
-      .select(`
+      .select(
+        `
         employee_email,
-        first_response_at,
         received_at,
-        response_time_minutes
-      `)
-      .eq("is_incoming", true)
-      .not("first_response_at", "is", null)
-      .gte("received_at", `${date}T00:00:00`)
-      .lte("received_at", `${date}T23:59:59`);
+        first_response_at
+        `
+      )
+      .gte("received_at", `${date}T00:00:00Z`)
+      .lte("received_at", `${date}T23:59:59Z`)
+      .not("first_response_at", "is", null);
 
-    if (error) throw error;
+    if (error) {
+      throw error;
+    }
 
-    if (!responses || responses.length === 0) {
+    if (!emails || emails.length === 0) {
       return res.json({
         success: true,
         date,
@@ -45,63 +44,51 @@ export default async function handler(req, res) {
       });
     }
 
-    // Aggregate per employee
-    const byEmployee = {};
+    const grouped = {};
 
-    for (const r of responses) {
-      const email = r.employee_email;
-      if (!email) continue;
+    for (const e of emails) {
+      const mins =
+        (new Date(e.first_response_at) -
+          new Date(e.received_at)) /
+        60000;
 
-      if (!byEmployee[email]) {
-        byEmployee[email] = {
-          employee_email: email,
-          total: 0,
-          totalMinutes: 0,
-          breaches: 0
+      if (!grouped[e.employee_email]) {
+        grouped[e.employee_email] = {
+          employee_email: e.employee_email,
+          total_first_responses: 0,
+          total_minutes: 0,
+          sla_breaches: 0
         };
       }
 
-      byEmployee[email].total += 1;
+      grouped[e.employee_email].total_first_responses += 1;
+      grouped[e.employee_email].total_minutes += mins;
 
-      const minutes =
-        r.response_time_minutes ??
-        Math.round(
-          (new Date(r.first_response_at) -
-            new Date(r.received_at)) /
-            60000
-        );
-
-      byEmployee[email].totalMinutes += minutes;
-
-      if (minutes > SLA_MINUTES) {
-        byEmployee[email].breaches += 1;
+      if (mins > SLA_MINUTES) {
+        grouped[e.employee_email].sla_breaches += 1;
       }
     }
 
-    // Prepare rows
-    const rows = Object.values(byEmployee).map(e => ({
+    const rows = Object.values(grouped).map(r => ({
       date,
-      employee_email: e.employee_email,
-      total_first_responses: e.total,
+      employee_email: r.employee_email,
+      total_first_responses: r.total_first_responses,
       avg_first_response_minutes: Math.round(
-        e.totalMinutes / e.total
+        r.total_minutes / r.total_first_responses
       ),
-      sla_breaches: e.breaches,
+      sla_breaches: r.sla_breaches,
       sla_target_minutes: SLA_MINUTES
     }));
 
-    // Delete existing rows for the date
-    await supabase
+    const { error: upsertError } = await supabase
       .from("daily_first_responder_metrics")
-      .delete()
-      .eq("date", date);
+      .upsert(rows, {
+        onConflict: "date,employee_email"
+      });
 
-    // Insert fresh aggregates
-    const { error: insertError } = await supabase
-      .from("daily_first_responder_metrics")
-      .insert(rows);
-
-    if (insertError) throw insertError;
+    if (upsertError) {
+      throw upsertError;
+    }
 
     return res.json({
       success: true,
@@ -109,9 +96,9 @@ export default async function handler(req, res) {
       inserted: rows.length
     });
   } catch (err) {
-    console.error("Aggregate error:", err);
+    console.error(err);
     return res.status(500).json({
-      error: "Aggregation failed",
+      error: "FUNCTION_INVOCATION_FAILED",
       message: err.message
     });
   }

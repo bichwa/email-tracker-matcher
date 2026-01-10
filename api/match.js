@@ -5,16 +5,27 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-const SLA_TARGET_MINUTES = parseInt(
-  process.env.SLA_TARGET_MINUTES || "15",
-  10
-);
-
-const BATCH_SIZE = 25;
+const SLA_TARGET_MINUTES = 15;
+const BATCH_SIZE = 30;
 const MAX_RUNTIME_MS = 50000;
+
+function detectScenario(email) {
+  if (email.is_system_email) return "SYSTEM_EXCLUDED";
+  if (email.is_solver_email) return "SOLVER_EXCLUDED";
+
+  if (email.employee_email?.toLowerCase().startsWith("team@")) {
+    if (email.tagged_employee_email) {
+      return "TEAM_TAGGED_PERSON";
+    }
+    return "TEAM_UNTAGGED";
+  }
+
+  return "DIRECT_PERSONAL";
+}
 
 async function runMatcher() {
   const start = Date.now();
+  let processed = 0;
   let matched = 0;
 
   const { data: incomingEmails, error } = await supabase
@@ -31,18 +42,32 @@ async function runMatcher() {
 
   for (const incoming of incomingEmails) {
     if (Date.now() - start > MAX_RUNTIME_MS) {
-      console.log("Stopping early to avoid timeout");
       break;
+    }
+
+    const scenario = detectScenario(incoming);
+
+    if (
+      scenario === "SYSTEM_EXCLUDED" ||
+      scenario === "SOLVER_EXCLUDED"
+    ) {
+      await supabase
+        .from("tracked_emails")
+        .update({
+          has_response: true,
+          scenario,
+          sla_exempt: true
+        })
+        .eq("id", incoming.id);
+
+      processed++;
+      continue;
     }
 
     let response = null;
 
-    const isTeamMailbox =
-      incoming.employee_email &&
-      incoming.employee_email.toLowerCase().startsWith("team@");
-
     if (incoming.conversation_id) {
-      let query = supabase
+      let convoQuery = supabase
         .from("tracked_emails")
         .select("*")
         .eq("conversation_id", incoming.conversation_id)
@@ -51,15 +76,15 @@ async function runMatcher() {
         .order("received_at", { ascending: true })
         .limit(1);
 
-      if (!isTeamMailbox) {
-        query = query.eq(
+      if (scenario === "DIRECT_PERSONAL") {
+        convoQuery = convoQuery.eq(
           "employee_email",
           incoming.employee_email
         );
       }
 
-      const { data } = await query;
-      if (data && data.length) {
+      const { data } = await convoQuery;
+      if (data?.length) {
         response = data[0];
       }
     }
@@ -70,7 +95,7 @@ async function runMatcher() {
           24 * 60 * 60 * 1000
       ).toISOString();
 
-      let query = supabase
+      let fallbackQuery = supabase
         .from("tracked_emails")
         .select("*")
         .eq("client_email", incoming.client_email)
@@ -80,20 +105,21 @@ async function runMatcher() {
         .order("received_at", { ascending: true })
         .limit(1);
 
-      if (!isTeamMailbox) {
-        query = query.eq(
+      if (scenario === "DIRECT_PERSONAL") {
+        fallbackQuery = fallbackQuery.eq(
           "employee_email",
           incoming.employee_email
         );
       }
 
-      const { data } = await query;
-      if (data && data.length) {
+      const { data } = await fallbackQuery;
+      if (data?.length) {
         response = data[0];
       }
     }
 
     if (!response) {
+      processed++;
       continue;
     }
 
@@ -102,60 +128,50 @@ async function runMatcher() {
         new Date(incoming.received_at)) / 60000
     );
 
-    const slaBreached =
-      responseMinutes > SLA_TARGET_MINUTES;
+    const slaBreached = responseMinutes > SLA_TARGET_MINUTES;
 
     await supabase
       .from("tracked_emails")
       .update({
         has_response: true,
         responded_at: response.received_at,
-        responded_by: response.responded_by,
-        response_time_minutes: responseMinutes,
         first_response_at:
-          incoming.first_response_at ??
-          response.received_at,
-        first_responder_email:
-          incoming.first_responder_email ??
-          response.responded_by,
-        sla_breached: slaBreached
+          incoming.first_response_at || response.received_at,
+        responder_email:
+          incoming.responder_email || response.employee_email,
+        response_time_minutes: responseMinutes,
+        sla_breached: slaBreached,
+        sla_target_minutes: SLA_TARGET_MINUTES,
+        scenario
       })
       .eq("id", incoming.id);
 
     matched++;
+    processed++;
   }
 
-  console.log("Matcher batch complete", {
-    matched,
-    processed: incomingEmails.length
+  console.log("Matcher completed", {
+    processed,
+    matched
   });
 }
 
 module.exports = async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-
     if (
-      authHeader !==
+      req.headers.authorization !==
       `Bearer ${process.env.CRON_SECRET}`
     ) {
-      return res.status(401).json({
-        error: "Unauthorized"
-      });
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
-    res.status(200).json({
-      ok: true,
-      batch: true
-    });
+    res.status(200).json({ ok: true });
 
     runMatcher().catch(err => {
-      console.error("Matcher error", err);
+      console.error("Matcher runtime error", err);
     });
   } catch (err) {
-    console.error("Handler error", err);
-    res.status(500).json({
-      error: "Internal error"
-    });
+    console.error("Matcher handler error", err);
+    res.status(500).json({ error: "Internal error" });
   }
 };

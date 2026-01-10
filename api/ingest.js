@@ -1,63 +1,39 @@
+// api/ingest.js
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 const SLA_MINUTES = 15;
 
-const SYSTEM_SENDERS = [
-  "solvit@solvit.com"
-];
-
+/* ---------------------------------------------
+   CONFIG
+---------------------------------------------- */
+const TEAM_INBOX = "team@solvit.co.ke";
+const SYSTEM_SENDERS = ["solvit@solvit.com"];
 const SYSTEM_SUBJECT_PATTERNS = [
-  "valuation status",
+  "valuation status update",
   "valuation request",
   "pending",
   "callback"
 ];
 
-const SOLVER_SUBJECT_PATTERNS = [
-  "attached",
-  "document",
-  "evaluation letter"
-];
-
-function isSystemEmail(email) {
-  if (!email) return false;
-  return SYSTEM_SENDERS.some(s =>
-    email.toLowerCase().includes(s)
-  );
+/* ---------------------------------------------
+   HELPERS
+---------------------------------------------- */
+function minutesBetween(a, b) {
+  return Math.round((new Date(b) - new Date(a)) / 60000);
 }
 
-function isSystemSubject(subject) {
+function isSystemEmail(from, subject) {
+  if (SYSTEM_SENDERS.includes(from)) return true;
   if (!subject) return false;
   return SYSTEM_SUBJECT_PATTERNS.some(p =>
     subject.toLowerCase().includes(p)
   );
-}
-
-function isSolverEmail(subject, hasAttachments) {
-  if (!subject && hasAttachments) return true;
-  if (!subject) return false;
-  return SOLVER_SUBJECT_PATTERNS.some(p =>
-    subject.toLowerCase().includes(p)
-  );
-}
-
-async function getGraphToken() {
-  const res = await axios.post(
-    `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}/oauth2/v2.0/token`,
-    new URLSearchParams({
-      client_id: process.env.AZURE_CLIENT_ID,
-      client_secret: process.env.AZURE_CLIENT_SECRET,
-      grant_type: "client_credentials",
-      scope: "https://graph.microsoft.com/.default"
-    })
-  );
-  return res.data.access_token;
 }
 
 function detectNamedEmployee(subject, body, employees) {
@@ -67,94 +43,105 @@ function detectNamedEmployee(subject, body, employees) {
   );
 }
 
-async function getActiveTeamAssignment(receivedAt) {
-  const { data } = await supabase
-    .from("team_assignments")
-    .select("employee_email")
-    .lte("start_at", receivedAt)
-    .or(`end_at.is.null,end_at.gte.${receivedAt}`)
-    .order("start_at", { ascending: false })
-    .limit(1);
-
-  return data?.[0]?.employee_email || null;
-}
-
+/* ---------------------------------------------
+   MAIN
+---------------------------------------------- */
 export default async function handler(req, res) {
-  if (
-    req.headers.authorization !==
-    `Bearer ${process.env.CRON_SECRET}`
-  ) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
   try {
-    const token = await getGraphToken();
+    if (
+      req.headers.authorization !==
+      `Bearer ${process.env.CRON_SECRET}`
+    ) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
 
+    /* -----------------------------------------
+       Load employees + assignments
+    ------------------------------------------ */
     const { data: employees } = await supabase
       .from("employees")
       .select("email, name");
 
-    const graph = await axios.get(
-      "https://graph.microsoft.com/v1.0/users/team@solvit.co.ke/mailFolders/Inbox/messages?$top=50",
+    const { data: assignments } = await supabase
+      .from("team_assignments")
+      .select("*")
+      .lte("start_at", new Date().toISOString())
+      .or(`end_at.is.null,end_at.gt.${new Date().toISOString()}`)
+      .limit(1);
+
+    const activeAssignment = assignments?.[0] || null;
+
+    /* -----------------------------------------
+       Fetch emails from Microsoft Graph
+    ------------------------------------------ */
+    const tokenRes = await axios.post(
+      `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}/oauth2/v2.0/token`,
+      new URLSearchParams({
+        client_id: process.env.AZURE_CLIENT_ID,
+        client_secret: process.env.AZURE_CLIENT_SECRET,
+        grant_type: "client_credentials",
+        scope: "https://graph.microsoft.com/.default"
+      })
+    );
+
+    const token = tokenRes.data.access_token;
+
+    const mailRes = await axios.get(
+      "https://graph.microsoft.com/v1.0/users/team@solvit.co.ke/messages?$top=50",
       {
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
+        headers: { Authorization: `Bearer ${token}` }
       }
     );
 
-    let inserted = 0;
+    const messages = mailRes.data.value;
 
-    for (const msg of graph.data.value) {
+    /* -----------------------------------------
+       Process messages
+    ------------------------------------------ */
+    for (const msg of messages) {
       const from = msg.from?.emailAddress?.address;
-      const subject = msg.subject || null;
+      const subject = msg.subject || "";
+      const body = msg.bodyPreview || "";
       const receivedAt = msg.receivedDateTime;
-      const hasAttachments = msg.hasAttachments;
-      const body = msg.body?.content || "";
 
-      if (isSystemEmail(from)) continue;
-      if (isSystemSubject(subject)) continue;
-      if (isSolverEmail(subject, hasAttachments)) continue;
+      if (isSystemEmail(from, subject)) continue;
 
-      let scenario = "team_unassigned";
-      let employeeEmail = null;
+      let scenario = null;
+      let assignedEmail = null;
 
-      const named = detectNamedEmployee(
-        subject,
-        body,
-        employees
-      );
-
-      if (named) {
-        scenario = "team_named";
-        employeeEmail = named.email;
-      } else {
-        employeeEmail = await getActiveTeamAssignment(receivedAt);
-        scenario = "team_assigned";
+      /* Scenario 1 */
+      const named = detectNamedEmployee(subject, body, employees);
+      if (msg.toRecipients.some(r => r.emailAddress.address === TEAM_INBOX) && named) {
+        scenario = "TEAM_TAGGED_PERSON";
+        assignedEmail = named.email;
       }
 
+      /* Scenario 2 */
+      if (!scenario && msg.toRecipients.some(r => r.emailAddress.address === TEAM_INBOX)) {
+        scenario = "TEAM_GENERAL";
+        assignedEmail = activeAssignment?.employee_email || null;
+      }
+
+      /* Scenario 3 */
+      if (!scenario) {
+        scenario = "DIRECT_PERSONAL";
+        assignedEmail = msg.toRecipients[0]?.emailAddress?.address;
+      }
+
+      /* Insert */
       await supabase.from("tracked_emails").upsert({
         graph_message_id: msg.id,
-        conversation_id: msg.conversationId,
         subject,
-        from_email: from,
-        to_email: "team@solvit.co.ke",
-        received_at: receivedAt,
-        is_incoming: true,
-        has_response: false,
         client_email: from,
-        employee_email: employeeEmail,
+        employee_email: assignedEmail,
+        received_at: receivedAt,
         scenario,
+        has_response: false,
         sla_minutes: SLA_MINUTES
       });
-
-      inserted++;
     }
 
-    res.json({
-      ok: true,
-      inserted
-    });
+    res.json({ ok: true, ingested: messages.length });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
